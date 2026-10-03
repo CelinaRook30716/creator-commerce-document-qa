@@ -4,6 +4,8 @@ import os
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -27,12 +29,21 @@ class InfraiClient:
         self.api_key = os.environ["INFRAI_API_KEY"]
 
     def post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
+        return self._request("POST", path, payload)
+
+    def get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("GET", path + "?" + urllib.parse.urlencode(params))
+
+    def delete(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("DELETE", path + "?" + urllib.parse.urlencode(params))
+
+    def _request(self, method: str, path: str, payload: Dict[str, Any] = None) -> Dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
         for attempt in range(4):
             req = urllib.request.Request(
                 self.base_url + path,
                 data=body,
-                method="POST",
+                method=method,
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             )
             try:
@@ -64,13 +75,26 @@ class InfraiClient:
 def answer_question(question: str, documents: List[Document], client: InfraiClient) -> Dict[str, Any]:
     """Index documents, retrieve evidence, then return a transparent answer."""
     dimension = len(client.embed(question))
-    collection = "creator-commerce-docs"
-    client.post("/v1/vector/collection/create", {"collection": collection, "dimension": dimension, "metric": "cosine", "metadata": {"purpose": "creator documents"}})
-    vectors = []
-    for doc in documents:
-        vectors.append({"id": doc.id, "values": client.embed(doc.text), "metadata": {"text": doc.text, "kind": doc.kind}})
-    client.post("/v1/vector/upsert", {"collection": collection, "vectors": vectors})
-    result = client.post("/v1/vector/query", {"collection": collection, "embedding": client.embed(question), "top_k": 3, "filter": {}, "include_metadata": True})
-    matches = result.get("matches", result if isinstance(result, list) else [])
-    evidence = [m.get("metadata", {}).get("text", "") for m in matches]
-    return {"question": question, "answer": evidence[0] if evidence else "No matching document found.", "evidence": evidence}
+    collection = f"creator-commerce-docs-{uuid.uuid4().hex}"
+    created = False
+    try:
+        client.post("/v1/vector/collection/create", {"collection": collection, "dimension": dimension, "metric": "cosine", "metadata": {"purpose": "creator documents"}})
+        created = True
+        vectors = []
+        for doc in documents:
+            vectors.append({"id": doc.id, "values": client.embed(doc.text), "metadata": {"text": doc.text, "kind": doc.kind}})
+        client.post("/v1/vector/upsert", {"collection": collection, "vectors": vectors})
+        result = client.post("/v1/vector/query", {"collection": collection, "embedding": client.embed(question), "top_k": 3, "filter": {}, "include_metadata": True})
+        matches = result.get("matches", result if isinstance(result, list) else [])
+        evidence = [m.get("metadata", {}).get("text", "") for m in matches]
+        return {"question": question, "answer": evidence[0] if evidence else "No matching document found.", "evidence": evidence}
+    finally:
+        if created:
+            client.delete("/v1/vector/collection/delete", {"collection": collection})
+            try:
+                client.get("/v1/vector/collection/get", {"collection": collection})
+            except InfraiError as exc:
+                if exc.code != "VECTOR_COLLECTION_NOT_FOUND":
+                    raise
+            else:
+                raise RuntimeError(f"collection cleanup could not be verified: {collection}")
